@@ -1,214 +1,363 @@
+import sqlite3
+import datetime as dt
+from typing import Optional
 
-import io
-import hashlib
-from decimal import Decimal, InvalidOperation, getcontext
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="EUREKA — Data Integrity Report Tool (Cloud)", page_icon="✅", layout="wide")
 
-BOSCH_RED = "#E20017"
+# ======================
+# 1. App config
+# ======================
+APP_NAME = "Astra"
+DB_PATH = "astra.db"
 
-st.markdown(f"""
-    <style>
-    .eureka-title {{ font-size: 28px; font-weight: 800; color:{BOSCH_RED}; }}
-    .eureka-sub {{ opacity:0.8; }}
-    .stDownloadButton>button {{ border-radius: 8px; padding: 8px 14px; }}
-    </style>
-""", unsafe_allow_html=True)
+st.set_page_config(page_title=APP_NAME, page_icon="🎫", layout="wide")
+st.title("🎫 Astra")
+st.caption("Simple, clean defect tracking with create & edit flow.")
 
-col_logo, col_title = st.columns([1,5])
-with col_logo:
-    st.image("E.png", width=100, caption=None, use_column_width=False) if "E.png" in st.session_state.get("assets", []) else st.write("")
-with col_title:
-    st.markdown('<div class="eureka-title">EUREKA — Data Integrity Report Tool (Cloud)</div>', unsafe_allow_html=True)
-    st.markdown('<div class="eureka-sub">Compare two CSV files, see differences, and export a report — all in your browser.</div>', unsafe_allow_html=True)
 
-st.sidebar.header("Options")
-compare_all_decimals = st.sidebar.checkbox("Strict decimal comparison (do not ignore trailing zeros)", value=False)
-case_insensitive = st.sidebar.checkbox("Case-insensitive string compare", value=True)
-drop_blank_rows = st.sidebar.checkbox("Drop trailing blank rows", value=True)
-show_samples = st.sidebar.checkbox("Show sample rows of each diff", value=True)
-key_columns = st.sidebar.text_input("Key columns (optional, comma-separated)",
-                                    help="If provided, we will align rows by these columns; otherwise use full-row hash.")
+# ======================
+# 2. Constants
+# ======================
+COMPANY_CODES = ["4310", "8410"]
+COMPANY_INDEX = {"4310": "1", "8410": "2"}
 
-left = st.file_uploader("Upload Source CSV (Left)", type=["csv"])
-right = st.file_uploader("Upload Target CSV (Right)", type=["csv"])
+MODULES = ["PLM", "PP", "FI", "SD", "MM", "QM", "ABAP", "BASIS", "OTHER"]
+DEFECT_TYPES = [
+    "Functional",
+    "Data Migration",
+    "Test Data",
+    "EDI set up",
+    "Configuration",
+    "Security/Authorization",
+    "Performance",
+    "Other",
+]
+PRIORITIES = ["P1 - Critical", "P2 - High", "P3 - Medium", "P4 - Low"]
+STATUSES = ["New", "In Progress", "Blocked", "Resolved", "Closed", "Reopened"]
+ENVIRONMENTS = ["P1S", "Q1S", "Q2S", "Q2C"]
+OPEN_WITH = ["SDS", "SNP", "Client", "Other"]
 
-def _drop_trailing_blank_rows(df: pd.DataFrame) -> pd.DataFrame:
+
+# ======================
+# 3. Database
+# ======================
+def get_conn():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=5000;")
+    return conn
+
+
+def init_db():
+    with get_conn() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS defects (
+                defect_id TEXT PRIMARY KEY,
+                company_code TEXT,
+                open_date TEXT,
+                module TEXT,
+                defect_title TEXT,
+                defect_type TEXT,
+                priority TEXT,
+                status TEXT,
+                resolved_date TEXT,
+                open_with TEXT,
+                reported_by TEXT,
+                responsible TEXT,
+                environment TEXT,
+                linked_test_id TEXT,
+                description TEXT,
+                steps TEXT,
+                created_at TEXT,
+                updated_at TEXT
+            )
+            """
+        )
+        conn.commit()
+
+
+# ======================
+# 4. Helpers
+# ======================
+def today():
+    return dt.date.today()
+
+
+def parse_date(x) -> Optional[dt.date]:
+    if not x:
+        return None
+    try:
+        return pd.to_datetime(x).date()
+    except Exception:
+        return None
+
+
+def date_str(d: Optional[dt.date]):
+    return d.isoformat() if d else None
+
+
+def compute_age(open_date, resolved_date, status):
+    if not open_date:
+        return None
+    end = resolved_date if status in ["Resolved", "Closed"] and resolved_date else today()
+    return (end - open_date).days
+
+
+def next_defect_id(module, company_code):
+    prefix = f"{module}-{COMPANY_INDEX[company_code]}-"
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT defect_id FROM defects WHERE defect_id LIKE ?",
+            (prefix + "%",),
+        ).fetchall()
+    nums = []
+    for r in rows:
+        try:
+            nums.append(int(r[0].split("-")[-1]))
+        except Exception:
+            pass
+    nxt = max(nums) + 1 if nums else 1
+    return f"{prefix}{nxt:03d}"
+
+
+# ======================
+# 5. CRUD
+# ======================
+def load_defects():
+    init_db()
+    with get_conn() as conn:
+        df = pd.read_sql("SELECT * FROM defects ORDER BY created_at DESC", conn)
+
     if df.empty:
-        return df
-    mask_nonblank = ~(df.isna() | (df.astype(str).str.strip() == "")).all(axis=1)
-    if not mask_nonblank.any():
-        return df.iloc[0:0]
-    last_idx = mask_nonblank[::-1].idxmax()
-    return df.loc[:last_idx]
+        return pd.DataFrame()
 
-def _normalize_decimal(val: str, strict: bool) -> str:
-    if val is None:
-        return ""
-    s = str(val).strip()
-    if s == "":
-        return ""
-    try:
-        if strict:
-            # keep exact string
-            return s
-        # ignore trailing zeros: normalize via Decimal.quantize without exponent
-        d = Decimal(s)
-        # normalize to remove trailing zeros
-        n = d.normalize()
-        # Convert scientific notation to plain string
-        return format(n, 'f').rstrip('0').rstrip('.') if '.' in format(n, 'f') else format(n, 'f')
-    except InvalidOperation:
-        return s
+    df["Open Date"] = df["open_date"].apply(parse_date)
+    df["Resolved Date"] = df["resolved_date"].apply(parse_date)
+    df["Age (days)"] = df.apply(
+        lambda r: compute_age(r["Open Date"], r["Resolved Date"], r["status"]), axis=1
+    )
 
-def _prep_df(df: pd.DataFrame) -> pd.DataFrame:
-    # Cast to string for stable hashing/compare
-    out = df.copy()
-    for c in out.columns:
-        if out[c].dtype == "float64" or out[c].dtype == "int64":
-            out[c] = out[c].astype(str)
-        else:
-            out[c] = out[c].astype(str)
-        if not compare_all_decimals:
-            # try to normalize decimals
-            out[c] = out[c].map(lambda x: _normalize_decimal(x, strict=False))
-        if case_insensitive:
-            out[c] = out[c].str.replace("\r\n","\n").str.strip().str.lower()
-        else:
-            out[c] = out[c].str.replace("\r\n","\n").str.strip()
-    return out
+    return df.rename(
+        columns={
+            "company_code": "Company Code",
+            "module": "Module",
+            "defect_id": "Defect ID",
+            "defect_title": "Defect Title",
+            "defect_type": "Defect Type",
+            "priority": "Priority",
+            "status": "Status",
+            "open_with": "Open with",
+            "reported_by": "Reported By",
+            "responsible": "Responsible",
+            "environment": "Environment",
+            "linked_test_id": "Linked Test ID",
+            "description": "Description",
+            "steps": "Description / Steps",
+        }
+    )
 
-def _hash_row(row: pd.Series) -> str:
-    # stable hash of concatenated values
-    m = hashlib.sha256()
-    m.update(("||".join(map(str, row.values))).encode("utf-8"))
-    return m.hexdigest()
 
-def compare_frames(dfL: pd.DataFrame, dfR: pd.DataFrame, keys=None):
-    report = {}
-    # Shapes / columns
-    report["left_rows"] = len(dfL)
-    report["right_rows"] = len(dfR)
-    report["left_cols"] = list(dfL.columns)
-    report["right_cols"] = list(dfR.columns)
-    report["missing_columns_in_right"] = [c for c in dfL.columns if c not in dfR.columns]
-    report["new_columns_in_right"] = [c for c in dfR.columns if c not in dfL.columns]
+def insert_defect(data):
+    now = dt.datetime.now().isoformat(timespec="seconds")
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO defects VALUES (
+                :defect_id, :company_code, :open_date, :module,
+                :defect_title, :defect_type, :priority, :status,
+                :resolved_date, :open_with, :reported_by, :responsible,
+                :environment, :linked_test_id, :description, :steps,
+                :created_at, :updated_at
+            )
+            """,
+            {**data, "created_at": now, "updated_at": now},
+        )
+        conn.commit()
 
-    # Align on keys or full-row hash
-    Lp = _prep_df(dfL)
-    Rp = _prep_df(dfR)
 
-    if keys:
-        k = [c.strip() for c in keys if c.strip() in Lp.columns and c.strip() in Rp.columns]
-        if k:
-            Lp["_key"] = Lp[k].astype(str).agg("||".join, axis=1)
-            Rp["_key"] = Rp[k].astype(str).agg("||".join, axis=1)
-        else:
-            keys = None
+def update_defect(defect_id, data):
+    now = dt.datetime.now().isoformat(timespec="seconds")
+    with get_conn() as conn:
+        conn.execute(
+            """
+            UPDATE defects SET
+                company_code=:company_code,
+                open_date=:open_date,
+                module=:module,
+                defect_title=:defect_title,
+                defect_type=:defect_type,
+                priority=:priority,
+                status=:status,
+                resolved_date=:resolved_date,
+                open_with=:open_with,
+                reported_by=:reported_by,
+                responsible=:responsible,
+                environment=:environment,
+                linked_test_id=:linked_test_id,
+                description=:description,
+                steps=:steps,
+                updated_at=:updated_at
+            WHERE defect_id=:defect_id
+            """,
+            {**data, "defect_id": defect_id, "updated_at": now},
+        )
+        conn.commit()
 
-    if not keys:
-        Lp["_key"] = Lp.apply(_hash_row, axis=1)
-        Rp["_key"] = Rp.apply(_hash_row, axis=1)
 
-    Lp["_source"] = "left"
-    Rp["_source"] = "right"
+# ======================
+# 6. Sidebar filters
+# ======================
+st.sidebar.header("Filters")
+company_f = st.sidebar.selectbox("Company Code", ["All"] + COMPANY_CODES)
+module_f = st.sidebar.selectbox("Module", ["All"] + MODULES)
+status_f = st.sidebar.selectbox("Status", ["All"] + STATUSES)
+priority_f = st.sidebar.selectbox("Priority", ["All"] + PRIORITIES)
+search = st.sidebar.text_input("Search").lower().strip()
 
-    # Presence comparison
-    L_keys = set(Lp["_key"])
-    R_keys = set(Rp["_key"])
-    only_left_keys = L_keys - R_keys
-    only_right_keys = R_keys - L_keys
-    common_keys = L_keys & R_keys
 
-    only_left = Lp[Lp["_key"].isin(only_left_keys)].drop(columns=["_key","_source"])
-    only_right = Rp[Rp["_key"].isin(only_right_keys)].drop(columns=["_key","_source"])
+# ======================
+# 7. Create defect
+# ======================
+st.subheader("➕ Create Defect")
 
-    report["only_left_count"] = len(only_left)
-    report["only_right_count"] = len(only_right)
+with st.form("create_form"):
+    c1, c2, c3, c4 = st.columns(4)
+    company_code = c1.selectbox("Company Code", COMPANY_CODES)
+    open_date = c2.date_input("Open Date", today())
+    module = c3.selectbox("Module", MODULES)
+    defect_id = next_defect_id(module, company_code)
+    c4.text_input("Defect ID", defect_id, disabled=True)
 
-    # For common keys, compare value-level diffs (only when keys provided; otherwise identical rows by hash)
-    cell_diffs = None
-    if keys:
-        l_common = Lp[Lp["_key"].isin(common_keys)].set_index("_key")
-        r_common = Rp[Rp["_key"].isin(common_keys)].set_index("_key")
-        shared_cols = [c for c in l_common.columns if c not in ("_source",)]
-        diffs = []
-        for key in common_keys:
-            lv = l_common.loc[key]
-            rv = r_common.loc[key]
-            for c in shared_cols:
-                if c == "_source": 
-                    continue
-                if lv[c] != rv[c]:
-                    diffs.append({"_key": key, "column": c, "left": lv[c], "right": rv[c]})
-        cell_diffs = pd.DataFrame(diffs) if diffs else pd.DataFrame(columns=["_key","column","left","right"])
-        report["cell_diff_count"] = len(cell_diffs)
+    defect_title = st.text_input("Defect Title *")
+    defect_type = st.selectbox("Defect Type", DEFECT_TYPES)
+    priority = st.selectbox("Priority", PRIORITIES, index=1)
+    status = st.selectbox("Status", STATUSES, index=0)
+
+    resolved_date = None
+    if status in ["Resolved", "Closed"]:
+        resolved_date = st.date_input("Resolved Date", today())
+
+    open_with = st.selectbox("Open with", OPEN_WITH)
+    reported_by = st.text_input("Reported By *")
+    responsible = st.text_input("Responsible")
+    environment = st.selectbox("Environment", ENVIRONMENTS)
+
+    linked_test_id = st.text_input("Linked Test ID")
+    description = st.text_area("Description")
+    steps = st.text_area("Description / Steps")
+
+    submit = st.form_submit_button("Create")
+
+if submit:
+    if not defect_title or not reported_by:
+        st.error("Defect Title and Reported By are required.")
     else:
-        report["cell_diff_count"] = 0
+        insert_defect(
+            {
+                "defect_id": defect_id,
+                "company_code": company_code,
+                "open_date": date_str(open_date),
+                "module": module,
+                "defect_title": defect_title,
+                "defect_type": defect_type,
+                "priority": priority,
+                "status": status,
+                "resolved_date": date_str(resolved_date),
+                "open_with": open_with,
+                "reported_by": reported_by,
+                "responsible": responsible,
+                "environment": environment,
+                "linked_test_id": linked_test_id,
+                "description": description,
+                "steps": steps,
+            }
+        )
+        st.success(f"Defect {defect_id} created.")
+        st.rerun()
 
-    return report, only_left, only_right, cell_diffs
 
-if left and right:
-    try:
-        dfL = pd.read_csv(left, dtype=str, keep_default_na=False)
-        dfR = pd.read_csv(right, dtype=str, keep_default_na=False)
-        if drop_blank_rows:
-            dfL = _drop_trailing_blank_rows(dfL)
-            dfR = _drop_trailing_blank_rows(dfR)
+# ======================
+# 8. List defects
+# ======================
+st.divider()
+st.subheader("📋 Defects")
 
-        keys = [k.strip() for k in key_columns.split(",")] if key_columns.strip() else None
-        report, only_left, only_right, cell_diffs = compare_frames(dfL, dfR, keys)
-
-        st.success("Comparison complete.")
-
-        # Summary cards
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Left rows", f"{report['left_rows']:,}")
-        c2.metric("Right rows", f"{report['right_rows']:,}")
-        c3.metric("Only-in-Left", f"{report['only_left_count']:,}")
-        c4.metric("Only-in-Right", f"{report['only_right_count']:,}")
-
-        st.subheader("Column differences")
-        col1, col2 = st.columns(2)
-        col1.write(pd.DataFrame({"Missing in Right": report["missing_columns_in_right"]}))
-        col2.write(pd.DataFrame({"New in Right": report["new_columns_in_right"]}))
-
-        if show_samples:
-            st.subheader("Only in Left (sample)")
-            st.dataframe(only_left.head(50))
-            st.subheader("Only in Right (sample)")
-            st.dataframe(only_right.head(50))
-
-        if report["cell_diff_count"] and cell_diffs is not None:
-            st.subheader("Cell-level differences (based on key columns)")
-            st.dataframe(cell_diffs.head(200))
-
-        # Build downloadable Excel report
-        def build_excel():
-            out = io.BytesIO()
-            with pd.ExcelWriter(out, engine="openpyxl") as xw:
-                pd.DataFrame({
-                    "left_rows":[report["left_rows"]],
-                    "right_rows":[report["right_rows"]],
-                    "only_left_count":[report["only_left_count"]],
-                    "only_right_count":[report["only_right_count"]],
-                    "cell_diff_count":[report["cell_diff_count"]]
-                }).to_excel(xw, index=False, sheet_name="Summary")
-                pd.DataFrame({"Missing in Right": report["missing_columns_in_right"]}).to_excel(xw, index=False, sheet_name="MissingColumnsInRight")
-                pd.DataFrame({"New in Right": report["new_columns_in_right"]}).to_excel(xw, index=False, sheet_name="NewColumnsInRight")
-                only_left.to_excel(xw, index=False, sheet_name="OnlyInLeft")
-                only_right.to_excel(xw, index=False, sheet_name="OnlyInRight")
-                if report["cell_diff_count"] and cell_diffs is not None:
-                    cell_diffs.to_excel(xw, index=False, sheet_name="CellDiffs")
-            out.seek(0)
-            return out
-
-        xls_bytes = build_excel()
-        st.download_button("Download Excel Report", data=xls_bytes, file_name="EUREKA_Report.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-    except Exception as e:
-        st.error(f"Error: {e}")
+df = load_defects()
+if df.empty:
+    st.info("No defects yet.")
 else:
-    st.info("Upload both Source and Target CSV files to begin.")
+    if company_f != "All":
+        df = df[df["Company Code"] == company_f]
+    if module_f != "All":
+        df = df[df["Module"] == module_f]
+    if status_f != "All":
+        df = df[df["Status"] == status_f]
+    if priority_f != "All":
+        df = df[df["Priority"] == priority_f]
+    if search:
+        df = df[
+            df[["Defect ID", "Defect Title", "Reported By", "Responsible"]]
+            .astype(str)
+            .agg(" ".join, axis=1)
+            .str.lower()
+            .str.contains(search)
+        ]
+
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    st.markdown("### ✏️ Edit Defect")
+    selected_id = st.selectbox("Select Defect ID", df["Defect ID"].tolist())
+
+    edit_row = df[df["Defect ID"] == selected_id].iloc[0]
+
+    with st.form("edit_form"):
+        company_code = st.selectbox("Company Code", COMPANY_CODES, index=COMPANY_CODES.index(edit_row["Company Code"]))
+        open_date = st.date_input("Open Date", edit_row["Open Date"])
+        module = st.selectbox("Module", MODULES, index=MODULES.index(edit_row["Module"]))
+
+        defect_title = st.text_input("Defect Title", edit_row["Defect Title"])
+        defect_type = st.selectbox("Defect Type", DEFECT_TYPES, index=DEFECT_TYPES.index(edit_row["Defect Type"]))
+        priority = st.selectbox("Priority", PRIORITIES, index=PRIORITIES.index(edit_row["Priority"]))
+        status = st.selectbox("Status", STATUSES, index=STATUSES.index(edit_row["Status"]))
+
+        resolved_date = edit_row["Resolved Date"]
+        if status in ["Resolved", "Closed"]:
+            resolved_date = st.date_input("Resolved Date", resolved_date or today())
+
+        open_with = st.selectbox("Open with", OPEN_WITH, index=OPEN_WITH.index(edit_row["Open with"]))
+        reported_by = st.text_input("Reported By", edit_row["Reported By"])
+        responsible = st.text_input("Responsible", edit_row["Responsible"])
+        environment = st.selectbox("Environment", ENVIRONMENTS, index=ENVIRONMENTS.index(edit_row["Environment"]))
+
+        linked_test_id = st.text_input("Linked Test ID", edit_row["Linked Test ID"])
+        description = st.text_area("Description", edit_row["Description"])
+        steps = st.text_area("Description / Steps", edit_row["Description / Steps"])
+
+        save = st.form_submit_button("Save Changes")
+
+    if save:
+        update_defect(
+            selected_id,
+            {
+                "company_code": company_code,
+                "open_date": date_str(open_date),
+                "module": module,
+                "defect_title": defect_title,
+                "defect_type": defect_type,
+                "priority": priority,
+                "status": status,
+                "resolved_date": date_str(resolved_date),
+                "open_with": open_with,
+                "reported_by": reported_by,
+                "responsible": responsible,
+                "environment": environment,
+                "linked_test_id": linked_test_id,
+                "description": description,
+                "steps": steps,
+            },
+        )
+        st.success("Defect updated.")
+        st.rerun()
